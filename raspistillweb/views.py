@@ -18,12 +18,21 @@ from pyramid.view import view_config
 from pyramid.httpexceptions import HTTPFound
 import exifread
 import os
+import shutil
+import signal
 import threading
 import tarfile
-from subprocess import call
+import zipfile
+from subprocess import call, Popen, PIPE
 from time import gmtime, strftime, localtime, asctime, mktime
 from stat import *
 from datetime import *
+
+from PIL import Image
+from bqapi.comm import BQSession
+from bqapi.util import save_blob
+from lxml import etree
+from socket import gethostname
 
 from sqlalchemy.exc import DBAPIError
 
@@ -67,21 +76,30 @@ ISO_OPTIONS = [
     ]
     
 IMAGE_RESOLUTIONS = [
-    '800x600','1024x786','1900x1200','1280x720','1920x1080', '2593x1944'
+    '800x600','1024x768','1900x1200','1280x720','1920x1080', '2593x1944'
+    ]
+    
+ENCODING_MODES = [
+    'jpg', 'png', 'bmp', 'gif'
     ]
     
 IMAGE_HEIGHT_ALERT = 'Please enter an image height between 0 and 1945.'
 IMAGE_WIDTH_ALERT = 'Please enter an image width between 0 and 2593.'
 IMAGE_EFFECT_ALERT = 'Please enter a valid image effect.'
 EXPOSURE_MODE_ALERT = 'Please enter a valid exposure mode.'
+ENCODING_MODE_ALERT = 'Please enter a valid encoding mode.'
 AWB_MODE_ALERT = 'Please enter a valid awb mode.'
 ISO_OPTION_ALERT = 'Please enter a valid ISO option.'
 IMAGE_ROTATION_ALERT = 'Please enter a valid image rotation option.'
+BISQUE_USER_ALERT = 'Please enter a valid BisQue username.'
+BISQUE_PSWD_ALERT = 'Please enter a valid BisQue password.'
+BISQUE_ROOT_URL_ALERT = 'Please enter a valid BisQue root URL.'
 
 THUMBNAIL_SIZE = '240:160:80'
 
 timelapse = False
 timelapse_database = None
+p_timelapse = None
 
 preferences_fail_alert = []
 preferences_success_alert = False
@@ -115,23 +133,33 @@ def settings_view(request):
         preferences_success_alert_temp = True
         preferences_success_alert = False
         
+    host_name = gethostname()
+    
     return {'project' : 'raspistillWeb',
-            'image_effect' : app_settings.image_effect,
-            'exposure_mode' : app_settings.exposure_mode,
-            'awb_mode' : app_settings.awb_mode,
+            'hostName' : host_name,
             'image_effects' : IMAGE_EFFECTS,
+            'image_effect' : app_settings.image_effect,
             'exposure_modes' : EXPOSURE_MODES,
+            'exposure_mode' : app_settings.exposure_mode,
             'awb_modes' : AWB_MODES,
+            'awb_mode' : app_settings.awb_mode,
+            'encoding_modes' : ENCODING_MODES,
+            'encoding_mode' : app_settings.encoding_mode,
+            'iso_options' : ISO_OPTIONS, 
+            'image_iso' : app_settings.image_ISO,
+            'image_resolutions' : IMAGE_RESOLUTIONS,
             'image_width' : str(app_settings.image_width),
             'image_height' : str(app_settings.image_height),
-            'image_iso' : app_settings.image_ISO,
-            'iso_options' :  ISO_OPTIONS, 
+            'image_rotation' : app_settings.image_rotation,
             'timelapse_interval' : str(app_settings.timelapse_interval),
             'timelapse_time' : str(app_settings.timelapse_time),
+            'bisque_enabled' : str(app_settings.bisque_enabled),
+            'bisque_user' : str(app_settings.bisque_user),
+            'bisque_pswd' : str(app_settings.bisque_pswd),
+            'bisque_root_url' : str(app_settings.bisque_root_url),
+            'bisque_local_copy' : str(app_settings.bisque_local_copy),
             'preferences_fail_alert' : preferences_fail_alert_temp,
-            'preferences_success_alert' : preferences_success_alert_temp,
-            'image_rotation' : app_settings.image_rotation,
-            'image_resolutions' : IMAGE_RESOLUTIONS
+            'preferences_success_alert' : preferences_success_alert_temp
             } 
             
 # View for the /archive site
@@ -201,6 +229,14 @@ def timelapse_start_view(request):
     t.start()
     return HTTPFound(location='/timelapse') 
 
+# View for the timelapse stop - no site will be generated
+@view_config(route_name='timelapse_stop')
+def timelapse_stop_view(request):
+    global timelapse, p_timelapse
+    if p_timelapse.poll() is None:
+        os.killpg(p_timelapse.pid, signal.SIGTERM)
+    timelapse = False
+    return HTTPFound(location='/timelapse')
 
 # View to take a photo - no site will be generated
 @view_config(route_name='photo')
@@ -209,7 +245,7 @@ def photo_view(request):
         return HTTPFound(location='/') 
     else:
         app_settings = DBSession.query(Settings).first()
-        filename = strftime("%Y-%m-%d.%H.%M.%S.jpg", localtime())
+        filename = strftime("%Y-%m-%d.%H.%M.%S.jpg", localtime()) + '.' + app_settings.encoding_mode
         take_photo(filename)
         
         f = open(RASPISTILL_DIRECTORY + filename,'rb')
@@ -220,6 +256,13 @@ def photo_view(request):
         filedata['image_effect'] = app_settings.image_effect
         filedata['exposure_mode'] = app_settings.exposure_mode
         filedata['awb_mode'] = app_settings.awb_mode
+        filedata['encoding_mode'] = app_settings.encoding_mode
+        filedata['ISO'] = str(app_settings.image_ISO)
+        im = Image.open(RASPISTILL_DIRECTORY + filename)
+        width, height = im.size
+        filedata['resolution'] = str(width) + ' x ' + str(height)
+        im.thumbnail(THUMBNAIL_SIZE)
+        im.save(THUMBNAIL_DIRECTORY + basename + '.jpg', 'JPEG', quality=THUMBNAIL_JPEG_QUALITY, optimize=True, progressive=True)
         '''
         imagedata = dict()
         imagedata['filename'] = filename
@@ -237,6 +280,7 @@ def photo_view(request):
                         image_effect=filedata['image_effect'],
                         exposure_mode=filedata['exposure_mode'],
                         awb_mode=filedata['awb_mode'],
+                        encoding_mode=filedata['encoding_mode'],
                         resolution=filedata['resolution'],
                         ISO=filedata['ISO'],
                         exposure_time=filedata['exposure_time'],
@@ -244,13 +288,21 @@ def photo_view(request):
                         timestamp='test',
                         filesize=filedata['filesize'])
         DBSession.add(picture)
+        #TODO: remove feature of local copy
+        #if bisque_enabled == "Yes" and bisque_local_copy == "No":
+        #    print 'Deleting local copy of \'' + filename + '\''
+        #    os.remove(RASPISTILL_DIRECTORY + filename)
         return HTTPFound(location='/')  
          
 # View for the archive delete - no site will be generated
 @view_config(route_name='delete_picture')
 def pic_delete_view(request):    
     p_id = request.params['id']
-    pic = DBSession.query(Picture).filter_by(id=int(p_id)).first()        
+    pic = DBSession.query(Picture).filter_by(id=int(p_id)).first()
+    pic = DBSession.query(Picture).filter_by(id=int(p_id)).first()
+    print('Deleting picture and thumbnail...')
+    os.remove(RASPISTILL_DIRECTORY + '/' + pic.filename)
+    os.remove(THUMBNAIL_DIRECTORY + '/' + pic.filename)
     DBSession.delete(pic)
     return HTTPFound(location='/archive')
 
@@ -258,7 +310,10 @@ def pic_delete_view(request):
 @view_config(route_name='delete_timelapse')
 def tl_delete_view(request):
     t_id = request.params['id']
-    tl = DBSession.query(Timelapse).filter_by(id=int(t_id)).first()        
+    tl = DBSession.query(Timelapse).filter_by(id=int(t_id)).first()
+    print 'Deleting time-lapse directory and archive...'
+    shutil.rmtree(TIMELAPSE_DIRECTORY + tl.filename)
+    os.remove(TIMELAPSE_DIRECTORY + tl.filename + '.tar.gz')
     DBSession.delete(tl)
     return HTTPFound(location='/timelapse')
 
@@ -278,6 +333,12 @@ def save_view(request):
     image_ISO_temp = request.params['isoOption']
     image_rotation_temp = request.params['imageRotation']
     image_resolution = request.params['imageResolution']
+    encoding_mode_temp = request.params['encodingMode']
+    bisque_enabled_temp = request.params['bisqueEnabled']
+    bisque_user_temp = request.params['bisqueUser']
+    bisque_pswd_temp = request.params['bisquePswd']
+    bisque_root_url_temp = request.params['bisqueRootUrl']
+    bisque_local_copy_temp = request.params['bisqueLocalCopy']
 
     app_settings = DBSession.query(Settings).first()
     
@@ -327,12 +388,55 @@ def save_view(request):
         app_settings.image_rotation = image_rotation_temp
     else:
         preferences_fail_alert.append(IMAGE_ROTATION_ALERT)  
-        
+    
+    if encoding_mode_temp and encoding_mode_temp in ENCODING_MODES:
+        app_settings.encoding_mode = encoding_mode_temp
+    else:
+        preferences_fail_alert.append(ENCODING_MODE_ALERT)
+    
+    if bisque_enabled_temp:
+        app_settings.bisque_enabled = bisque_enabled_temp
+        if app_settings.bisque_enabled == "Yes":
+            if bisque_user_temp:
+                app_settings.bisque_user = bisque_user_temp
+            else:
+                preferences_fail_alert.append(BISQUE_USER_ALERT)
+            if bisque_pswd_temp:
+                app_settings.bisque_pswd = bisque_pswd_temp
+            else:
+                preferences_fail_alert.append(BISQUE_PSWD_ALERT)
+            if bisque_root_url_temp:
+                app_settings.bisque_root_url = bisque_root_url_temp
+            else:
+                preferences_fail_alert.append(BISQUE_ROOT_URL_ALERT)
+        if bisque_local_copy_temp and bisque_local_copy_temp in ['Yes','No']:
+            app_settings.bisque_local_copy = bisque_local_copy_temp
+
     if preferences_fail_alert == []:
         preferences_success_alert = True 
     
     DBSession.flush()      
     return HTTPFound(location='/settings')  
+
+# View for the reboot
+@view_config(route_name='reboot', renderer='shutdown.mako')
+def reboot_view(request):
+    host_name = gethostname()
+    os.system("sudo shutdown -r now")
+    #os.system("sudo shutdown -k now")
+    return {'project': 'raspistillWeb',
+            'hostName' : host_name,
+            }
+
+# View for the shutdown
+@view_config(route_name='shutdown', renderer='shutdown.mako')
+def shutdown_view(request):
+    host_name = gethostname()
+    os.system("sudo shutdown -hP now")
+    #os.system("sudo shutdown -k now")
+    return {'project': 'raspistillWeb',
+            'hostName' : host_name,
+            }
 
 ###############################################################################
 ############ Helper functions to keep the code clean ##########################
@@ -355,7 +459,7 @@ def take_photo(filename):
         + ' -ifx ' + app_settings.image_effect
         + iso_call
         + ' -th ' + THUMBNAIL_SIZE 
-        + ' -o ' + RASPISTILL_DIRECTORY + filename], shell=True
+        + ' -o ' + RASPISTILL_DIRECTORY + filename], stdout=PIPE shell=True
         )
     if not (RASPISTILL_DIRECTORY == 'raspistillweb/pictures/'):
         call (
@@ -364,6 +468,22 @@ def take_photo(filename):
             )
     generate_thumbnail(filename)
     
+    if app_settings.bisque_enabled == 'Yes':
+        resource = etree.Element('image', name=filename)
+        etree.SubElement(resource, 'tag', name="experiment", value="Phenotiki")
+        etree.SubElement(resource, 'tag', name="timestamp", value=os.path.splitext(filename)[0])
+        bqsession = setbasicauth(bisque_root_url, bisque_user, bisque_pswd)
+        print 'Uploading \'' + filename + '\' to Bisque...'
+        start_time = time()
+        r = save_blob(bqsession, localfile=RASPISTILL_DIRECTORY+filename, resource=resource)
+        elapsed_time = time() - start_time
+        if r is None:
+            print 'Error uploading!'
+            preferences_fail_alert.append('Error uploading \'' + filename + '\' to Bisque!')
+        else:
+            print 'Image uploaded in %.2f seconds' % elapsed_time
+            print r.items()
+            print 'Image URI:', r.get('uri')
 
     #call(['cp raspistillweb/pictures/preview.jpg raspistillweb/pictures/'+filename],shell=True)
     #generate_thumbnail(filename)
@@ -371,38 +491,65 @@ def take_photo(filename):
 
     
 def take_timelapse(filename):
-    global timelapse, timelapse_database
+    global timelapse, timelapse_database, p_timelapse
 
     app_settings = DBSession.query(Settings).first()
     timelapsedata = {'filename' :  filename}
     timelapsedata['timeStart'] = str(asctime(localtime()))
     os.makedirs(TIMELAPSE_DIRECTORY + filename)
-    call (
-        ['raspistill'
-        + ' -w ' + str(app_settings.image_width)
-        + ' -h ' + str(app_settings.image_height)
-        + ' -ex ' + app_settings.exposure_mode
-        + ' -awb ' + app_settings.awb_mode
-        + ' -ifx ' + app_settings.image_effect
-        + ' -th ' + THUMBNAIL_SIZE
-        + ' -tl ' + str(app_settings.timelapse_interval)
-        + ' -t ' + str(app_settings.timelapse_time) 
-        + ' -o ' + TIMELAPSE_DIRECTORY + filename + '/'
-        + filename + '_%04d.jpg'], shell=True
-        )    
+    timelapse_interval_ms = app_settings.timelapse_interval*1000
+    timelapse_time_ms = app_settings.timelapse_time*1000
+    if app_settings.image_ISO == 'auto':
+        iso_call = ''
+    else:
+        iso_call = ' -ISO ' + str(app_settings.image_ISO)
+    try:
+        print 'Starting time-lapse acquisition...'
+        #TODO: rename images with timestamp
+        p_timelapse = Popen(
+            ['raspistill '
+            + ' -n '
+            + ' -w ' + str(app_settings.image_width)
+            + ' -h ' + str(app_settings.image_height)
+            + ' -e ' + app_settings.encoding_mode
+            + ' -ex ' + app_settings.exposure_mode
+            + ' -awb ' + app_settings.awb_mode
+            + ' -rot ' + str(app_settings.image_rotation)
+            + ' -ifx ' + app_settings.image_effect
+            + iso_call
+            + ' -t ' + str(timelapse_time_ms) 
+            + ' -tl ' + str(timelapse_interval_ms)
+            + ' -o ' + TIMELAPSE_DIRECTORY + filename + '/'
+            + 'IMG_' + filename + '_%04d.' + app_settings.encoding_mode],
+            stdout=PIPE, shell=True, preexec_fn=os.setsid
+            )
+        p_timelapse.wait()
+        print 'Finished time-lapse acquisition.'
+    except:
+        #p_timelapse.kill()
+        os.killpg(p_timelapse.pid, signal.SIGTERM)
+        p_timelapse.wait()
+        raise
+    timelapsedata['n_images'] = str(len([name for name in os.listdir(TIMELAPSE_DIRECTORY + filename) if os.path.isfile(os.path.join(TIMELAPSE_DIRECTORY + filename, name))]))
+    timelapsedata['resolution'] = str(app_settings.image_width) + ' x ' + str(app_settings.image_height)
     timelapsedata['image_effect'] = app_settings.image_effect
     timelapsedata['exposure_mode'] = app_settings.exposure_mode
+    timelapsedata['encoding_mode'] = app_settings.encoding_mode
     timelapsedata['awb_mode'] = app_settings.awb_mode
     timelapsedata['timeEnd'] = str(asctime(localtime()))
 
     timelapse_data = Timelapse(
                         filename = timelapsedata['filename'],
                         timeStart = timelapsedata['timeStart'],
+                        n_images = timelapsedata['n_images'],
+                        resolution = timelapsedata['resolution'],
                         image_effect = timelapsedata['image_effect'],
                         exposure_mode = timelapsedata['exposure_mode'],
+                        encoding_mode = timelapsedata['encoding_mode'],
                         awb_mode = timelapsedata['awb_mode'],
                         timeEnd = timelapsedata['timeEnd'],
                     )
+
 
     print('Adding timelapse to DB')
     DBSession.add(timelapse_data)
@@ -443,13 +590,21 @@ def extract_filedata(st):
         'timestamp' : localtime(),
         'filesize': str((st[ST_SIZE])/1000) + ' kB'
             }
-            
+
+def setbasicauth(bisquehost, username, password):
+    bqsession = BQSession()
+    bqsession.init_cas(username, password, bisque_root=bisquehost, create_mex=False)
+    r = bqsession.c.post(bisquehost + "/auth_service/setbasicauth", data = { 'username': username, 'passwd': password})
+    print r
+    return bqsession
+
 def get_picture_data(picture):
     imagedata = dict()
     imagedata['id'] = str(picture.id)
     imagedata['filename'] = picture.filename
     imagedata['image_effect'] = picture.image_effect
     imagedata['exposure_mode'] = picture.exposure_mode
+    imagedata['encoding_mode'] = picture.encoding_mode
     imagedata['awb_mode'] = picture.awb_mode
     imagedata['resolution'] = picture.resolution
     imagedata['ISO'] = str(picture.ISO)
@@ -468,4 +623,7 @@ def get_timelapse_data(timelapse_rec):
     timelapse_data['awb_mode'] = timelapse_rec.awb_mode
     timelapse_data['timeStart'] = str(timelapse_rec.timeStart)
     timelapse_data['timeEnd'] = str(timelapse_rec.timeEnd)
+    timelapse_data['n_images'] = str(timelapse_rec.n_images)
+    timelapse_data['resolution'] = timelapse_rec.resolution
+    timelapse_data['encoding_mode'] = timelapse_rec.encoding_mode
     return timelapse_data
