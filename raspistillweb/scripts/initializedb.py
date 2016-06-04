@@ -48,7 +48,8 @@ def main(argv=sys.argv):
                         exposure_time ='1',
                         date = '1',
                         timestamp = '1',
-                        filesize = '1'
+                        filesize = '1',
+                        encoding_mode = '-'
                         )
         DBSession.add(picture)
 
@@ -61,7 +62,13 @@ def main(argv=sys.argv):
                         image_effect = 'none',
                         awb_mode = 'auto',
                         image_ISO = 'auto',
-                        image_rotation = '0'
+                        image_rotation = '0',
+                        encoding_mode = 'jpg',
+                        bisque_enabled = 'No',
+                        bisque_user = '',
+                        bisque_pswd = '',
+                        bisque_root_url = 'http://bisque.iplantcollaborative.org',
+                        bisque_local_copy = 'Yes'
                         )
         DBSession.add(app_settings)
 
@@ -71,7 +78,10 @@ def main(argv=sys.argv):
                         image_effect = 'test',
                         exposure_mode = 'test',
                         awb_mode = 'auto',
-                        timeEnd = 'none'
+                        timeEnd = 'none',
+                        n_images = 1,
+                        resolution = '-',
+                        encoding_mode = '-'
                         )
 
         DBSession.add(timelapse)
