@@ -1,0 +1,11 @@
+[Unit]
+Description=raspistillWeb
+After=network.target
+
+[Service]
+Type=simple
+#Edit this to match your installation
+ExecStart=/home/alarm/python-env/raspistillWeb/arch-start.sh
+
+[Install]
+WantedBy=default.target
