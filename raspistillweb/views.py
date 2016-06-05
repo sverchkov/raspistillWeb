@@ -26,7 +26,7 @@ import tarfile
 from time import gmtime, strftime, localtime, asctime, mktime, sleep
 from stat import *
 from datetime import *
-import Image
+from PIL import Image
 #from bqapi.bqclass import fromXml
 from bqapi.comm import BQSession, BQCommError
 from bqapi.util import save_blob
@@ -208,8 +208,9 @@ def timelapse_view(request):
 # View for the reboot
 @view_config(route_name='reboot', renderer='shutdown.mako')
 def reboot_view(request):
-    os.system("sudo shutdown -r now")
+    #os.system("sudo shutdown -r now")
     #os.system("sudo shutdown -k now")
+    os.system("reboot")
     host_name = gethostname()
     return {'project': 'raspistillWeb',
             'hostName' : host_name,
@@ -218,8 +219,9 @@ def reboot_view(request):
 # View for the shutdown
 @view_config(route_name='shutdown', renderer='shutdown.mako')
 def shutdown_view(request):
-    os.system("sudo shutdown -hP now")
+    #os.system("sudo shutdown -hP now")
     #os.system("sudo shutdown -k now")
+    os.system("poweroff")
     host_name = gethostname()
     return {'project': 'raspistillWeb',
             'hostName' : host_name,
