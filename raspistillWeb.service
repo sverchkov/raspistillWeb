@@ -1,10 +1,20 @@
+# This is a systemd unit file for starting raspistillWeb
+# I think this starts it under root?
+# Place it in /usr/lib/systemd/system/ (for most systems)
+# Then make sure to invoke: systemctl daemon-reload
+# To immediately start the service: systemctl start raspistillWeb
+# To set the service to start on boot: systemctl enable raspistillWeb
+# !!! Make sure ExecStart points to the location of your autostart script !!!
+#
+# Author: Yuriy Sverchkov (yuriy.sverchkov@wisc.edu)
+
 [Unit]
 Description=raspistillWeb
 After=network.target
 
 [Service]
 Type=simple
-#Edit this to match your installation
+# Edit this to match your installation
 ExecStart=/home/alarm/python-env/raspistillWeb/arch-start.sh
 
 [Install]
